@@ -1,0 +1,11 @@
+{
+    "sif": "/gpfs/ngsdata/QGP_projects/QF-QGP-RES-PUB-006/users/mdjekidel1_qgp/MeGAne/MEGAnE.sif",
+    "fasta": "/gpfs/ngsdata/QGP_projects/QF-QGP-RES-PUB-006/users/mdjekidel1_qgp/MeGAne/ref/hg38.fa",
+    "mk": "/gpfs/ngsdata/QGP_projects/QF-QGP-RES-PUB-006/users/mdjekidel1_qgp/MeGAne/pipeline/megane_kmer_set/refGenome.mk",
+    "bindingDir" : "/gpfs/",
+    "hpc_queue": "qgp",
+    "cohortName": "QGP",
+    "dirlist": "/home/mdjekidel1_qgp/QF-QGP-RES-PUB-006/users/mdjekidel1_qgp/MeGAne/output/dirlist_all.txt",        
+    "outDirBase" : "./megane_output",
+    "rscript" : "/home/mdjekidel1_qgp/QF-QGP-RES-PUB-006/users/mdjekidel1_qgp/MeGAne/pipeline/getDirPaths.R"
+}

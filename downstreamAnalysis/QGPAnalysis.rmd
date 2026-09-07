@@ -1,0 +1,784 @@
+---
+title: "QGP MEV Analysis"
+author: "Mohamed Nadhir Djekidel"
+output: html_document
+---
+
+
+
+# Load libraries
+
+```{r}
+suppressPackageStartupMessages(require(tidyverse))
+suppressPackageStartupMessages(require(glue))
+suppressPackageStartupMessages(require(ggplot2))
+suppressPackageStartupMessages(require(readr))
+suppressPackageStartupMessages(require(VariantAnnotation))
+suppressPackageStartupMessages(require(purrr))
+suppressPackageStartupMessages(require(GenomicRanges))
+suppressPackageStartupMessages(require(tidyverse))
+suppressPackageStartupMessages(require(SCP))
+suppressPackageStartupMessages(require(RColorBrewer))
+
+source("../R/utils.R")
+```
+
+
+```{r}
+dout="../data/MEGAnE_analysis"
+fs::dir_create(dout)
+```
+
+
+## Load data
+
+```{r}
+QGP_population_structure = readr::read_tsv(
+  "../data-raw/QGP_populations/qgp_population_structure_clusters_ids.txt",col_names = T)
+
+head(QGP_population_structure)
+```
+
+
+```{r}
+QGP_population_structure = readr::read_tsv("../data-raw/qgp_population_structure.txt", col_names = F,show_col_types = F)
+colnames(QGP_population_structure) = c("Sample","Population")
+
+QGP_population_structure$Population[ QGP_population_structure$Population == "F1" ] = "QGP_GA"
+QGP_population_structure$Population[ QGP_population_structure$Population == "F2" ] = "QGP_AFR"
+QGP_population_structure$Population[ QGP_population_structure$Population == "F3" ] = "QGP_WEP"
+QGP_population_structure$Population[ QGP_population_structure$Population == "F4" ] = "QGP_PAR"
+QGP_population_structure$Population[ QGP_population_structure$Population == "F6" ] = "QGP_SAS"
+QGP_population_structure$Population[ QGP_population_structure$Population == "F9" ] = "QGP_ADM"
+
+## we have only one sample classified as F7
+QGP_population_structure = subset(QGP_population_structure, Population != "F7")
+
+
+QGP_population_structure$Population = factor(QGP_population_structure$Population, 
+                                             levels =  rev(names(sort(table(QGP_population_structure$Population))))
+                                             )
+```
+
+
+```{r}
+Sys.setenv(VROOM_CONNECTION_SIZE = 5000000)
+QGP_ME_VCF <- VariantAnnotation::readVcf("../MeGAne/QGP_MeGANE_jointcall_out/QGP_common/QGP_biallelic_PASS_vcf.gz",genome="hg38")
+dim(geno(QGP_ME_VCF)$GT)
+```
+
+```{r}
+gp1000_ME_VCF <- VariantAnnotation::readVcf("../MeGAne/1000GP/phasing_out/GRCh38_2504/GRCh38_2504_biallelic_PASS.fixed.vcf.gz",
+                                            genome="hg38")
+dim(geno(gp1000_ME_VCF)$GT)
+```
+
+```{r}
+gp1000_SVTYPES <- readr::read_tsv("../MeGAne/BBJ_Megane/hum0014.v28.MEs.v1/BBJ_4880_subjects_MEV_POS_AF.GRCh37.txt.gz",col_names = FALSE)
+```
+
+```{r}
+BBJ_SVTYPES <- readr::read_tsv("../MeGAne/BBJ_Megane/hum0014.v28.MEs.v1/BBJ_4880_subjects_MEV_POS_AF.GRCh37.txt.gz",
+                               col_names = TRUE,show_col_types = FALSE) |>
+  dplyr::rename(SVTYPE = ME_CLASS, MEI = ME, CHROM=CHR)
+```
+
+
+## STATs about the distribution of the detected Mobile-elements
+
+```{r}
+QGP_SVTYPES = as.data.frame(VariantAnnotation::info(QGP_ME_VCF))|> 
+  mutate(
+    CHROM = as.character(seqnames(rowRanges(QGP_ME_VCF))),
+    POS   = start(rowRanges(QGP_ME_VCF)),
+    ID    = rownames(VariantAnnotation::info(QGP_ME_VCF))
+  ) |>
+  select(ID, CHROM, POS, SVTYPE, everything()) |> 
+   dplyr::mutate(SVTYPE = unlist(SVTYPE), 
+                 MEI = unlist(MEI),
+                 MEPRED = sapply(MEPRED,function(x) {
+                   ifelse(length(x) == 0, "",x)
+                 }), 
+                 MESTRAND = sapply(MESTRAND,function(x) {
+                   ifelse(length(x) == 0, "+",x)
+                 })
+                 ) 
+
+gp1000_SVTYPES = as.data.frame(VariantAnnotation::info(gp1000_ME_VCF)) |>
+  mutate(
+    CHROM = as.character(seqnames(rowRanges(gp1000_ME_VCF))),
+    POS   = start(rowRanges(gp1000_ME_VCF)),
+    ID    = rownames(VariantAnnotation::info(gp1000_ME_VCF))
+  ) |>
+  dplyr::select(ID, CHROM, POS, SVTYPE, everything()) |> 
+  dplyr::mutate(SVTYPE = unlist(SVTYPE), 
+                 MEI = unlist(MEI),
+                 MEPRED = sapply(MEPRED,function(x) {
+                   ifelse(length(x) == 0, "",x)
+                 })
+                 )
+
+```
+
+
+```{r}
+gp1000_SVTYPES_unique = gp1000_SVTYPES |>
+  dplyr::select(SVTYPE, MEI) |>
+  dplyr::distinct()
+
+QGP_SVTYPES_unique = QGP_SVTYPES  |>
+  dplyr::select(SVTYPE, MEI) |>
+  dplyr::distinct()
+
+table(QGP_SVTYPES_unique$MEI %in% gp1000_SVTYPES_unique$MEI)
+```
+
+## Classify MEI into categories
+
+```{r}
+classify_part <- function(p) {
+  if (grepl("^AluY", p))                                      return("AluY")
+  if (grepl("^Alu", p) || p %in% c("FLAM_C","FLAM_A","FRAM",
+                                     "FAM","FLA","FLAM","ALU")) return("Alu")
+  if (p == "L1HS")                                             return("L1HS")
+  if (grepl("^L1", p) || p %in% c("pA","pT"))                 return("L1")
+  if (grepl("^SVA_", p))                                       return("SVA")
+  if (p %in% c("LTR5_Hs","LTR5B","HERVK","HERVK3I","HERVK11I",
+               "HERVKC4","HERV-K14I","MER11B","MER11C",
+               "LTR13","LTR14"))                               return("HERV-K")
+  return("Others")
+}
+
+tie_priority <- c("AluY","Alu","L1HS","HERV-K","L1","SVA","Others")
+ 
+classify_mei <- function(mei) {
+  parts  <- trimws(strsplit(as.character(mei), "\\|")[[1]])
+  cats   <- sapply(parts, classify_part, USE.NAMES = FALSE)
+  counts <- sort(table(cats), decreasing = TRUE)
+ 
+  # Check for tie at the top
+  top_count <- counts[1]
+  tied_cats <- names(counts[counts == top_count])
+ 
+  if (length(tied_cats) == 1) {
+    return(tied_cats)
+  } else {
+    # Break tie by priority
+    for (p in tie_priority) {
+      if (p %in% tied_cats) return(p)
+    }
+  }
+  return("Others")
+}
+ 
+# Apply classification
+QGP_SVTYPES$category  <- sapply(QGP_SVTYPES$MEI,  classify_mei)
+gp1000_SVTYPES$category <- sapply(gp1000_SVTYPES$MEI, classify_mei)
+
+BBJ_SVTYPES$category <- sapply(BBJ_SVTYPES$MEI, classify_mei)
+
+```
+
+```{r}
+100 * sort(table(QGP_SVTYPES$category),decreasing = T)/nrow(QGP_SVTYPES)
+```
+
+
+```{r}
+100 * sort(table(gp1000_SVTYPES$category),decreasing = T)/nrow(gp1000_SVTYPES)
+```
+
+```{r}
+100 * sort(table(BBJ_SVTYPES$category),decreasing = T)/nrow(BBJ_SVTYPES)
+```
+
+
+## Update SVTYPEs in QGP VCF
+
+```{r}
+
+pos = match(QGP_SVTYPES$SVTYPE , QGP_SVTYPES_unique$SVTYPE)
+QGP_SVTYPES$SVTYPE_1000gp = QGP_SVTYPES_unique$SVTYPE_1000gp[pos]
+
+if( all(rownames(QGP_SVTYPES) == info(QGP_ME_VCF) |> rownames())){
+  info(QGP_ME_VCF)$SVTYPE =  QGP_SVTYPES$SVTYPE_1000gp 
+}
+
+
+info(QGP_ME_VCF)$METYPE= info(QGP_ME_VCF)$SVTYPE
+
+info(QGP_ME_VCF)$SVTYPE= "INS"
+
+hdr <- header(QGP_ME_VCF)
+hdr_info = info(hdr)
+
+new_field <- DataFrame(
+  Number = ".",
+  Type = "String",
+  Description = "MEGAnE assigned SVTYPE",
+  row.names = "METYPE"
+)
+
+hdr_info = rbind(hdr_info, new_field)
+
+info(hdr) = hdr_info
+
+header(QGP_ME_VCF) = hdr
+
+QGP_ME_VCF = GenomicRanges::sort(QGP_ME_VCF)
+
+
+
+VariantAnnotation::writeVcf(obj = QGP_ME_VCF, 
+                            filename = "../MeGAne/QGP_MeGANE_jointcall_out/QGP_common/QGP_biallelic_PASS_Updated.vcf")
+```
+
+
+## Plot major MEV categories distribution across QGP, 1000 GP, and BBJ populations
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+
+
+
+me_colors <- c(
+  "AluY"   = "#ffcb69",
+  "Alu"    = "#e8ac65",
+  "L1HS"   = "#73bfb8",
+  "SVA"    = "#3da5d9",
+  "L1"     = "#2364aa",
+  "HERV-K" = "#2c6e49",
+  "Others" = "#BFBFBF" 
+)
+
+
+qgp_pie   <- QGP_SVTYPES |>
+  dplyr::mutate(category = factor(category, levels = names(me_colors) )) |>
+  dplyr::group_by(category) |>
+  dplyr::tally() |>
+  dplyr::mutate(pct=100 * n/sum(n)) |>
+  dplyr::arrange(category) |>
+  dplyr::mutate(label = glue("{category} ({round(pct,2)}%)"))
+  
+  
+
+gp1000_pie <- gp1000_SVTYPES |>
+  dplyr::mutate(category = factor(category, levels = names(me_colors) )) |>
+  dplyr::filter(CHROM %in% unique(QGP_SVTYPES$CHROM)) |>
+  dplyr::group_by(category) |>
+  dplyr::tally() |>
+  dplyr::mutate(pct=100 * n/sum(n)) |>
+  dplyr::arrange(category) |>
+  dplyr::mutate(label = glue("{category} ({round(pct,2)}%)"))
+
+
+BBJ_pie <- BBJ_SVTYPES |>
+  dplyr::mutate(category = factor(category, levels = names(me_colors) )) |>
+  dplyr::group_by(category) |>
+  dplyr::tally() |>
+  dplyr::mutate(pct=100 * n/sum(n)) |>
+  dplyr::arrange(category) |>
+  dplyr::mutate(label = glue("{category} ({round(pct,2)}%)"))
+
+```
+
+
+```{r fig.height=6, fig.width=12}
+p1 = plotthis::PieChart(qgp_pie,x="label", y="pct",
+                        group_by="category",
+                        label = "category",
+                   #label = "category",
+                        palcolor = me_colors, 
+                   title = "QGP") +
+  theme(legend.position = "bottom", 
+        plot.title = element_text(hjust = 0.5))
+
+p2 = plotthis::PieChart(gp1000_pie,x="label", y="pct",
+                        group_by="category",
+                        label = "category",
+                        palcolor = me_colors, 
+                        title = "1000 GP") +
+  theme(legend.position = "bottom", 
+        plot.title = element_text(hjust = 0.5))
+
+
+p3 = plotthis::PieChart(BBJ_pie,x="label", y="pct",
+                        group_by="category",
+                        label = "category",
+                        palcolor = me_colors, 
+                        title = "BBJ") +
+  theme(legend.position = "bottom", 
+        plot.title = element_text(hjust = 0.5))
+
+
+pdf(file =  "../data/MEGAnE_analysis/MEV_families_proportions_v2.pdf",width = 12,height = 6)
+print(p2 + p1 + p3)
+dev.off()
+
+print(p2 + p1 + p3)
+```
+
+
+```{r}
+subject_mapping = readr::read_tsv("../data-raw/006_subject_mapping.txt")
+subject_clusters = readr::read_tsv("../data-raw/QGP_populations/qgp_population_structure_clusters_ids.txt")
+```
+
+```{r}
+table(gsub("_.*","",QGP_population_structure$Sample) %in% subject_mapping$old_sidra_subject_id)
+```
+
+```{r}
+QGP_population_structure$ID = gsub("_.*","",QGP_population_structure$Sample)
+pos_new = which(QGP_population_structure$ID %in% subject_mapping$new_sidra_subject_id)
+new_idx = match(QGP_population_structure$ID[pos_new] , subject_mapping$new_sidra_subject_id)
+
+pos_old = which(QGP_population_structure$ID %in% subject_mapping$old_sidra_subject_id)
+old_idx = match(QGP_population_structure$ID[pos_old] , subject_mapping$old_sidra_subject_id)
+
+QGP_population_structure$NewID = NA
+
+QGP_population_structure$NewID[pos_new] = subject_mapping$new_sidra_subject_id[new_idx]
+QGP_population_structure$NewID[pos_old] = subject_mapping$new_sidra_subject_id[old_idx]
+```
+
+
+```{r}
+table(  QGP_population_structure$NewID  %in%  gsub("_.*","",QGP_population_structure$Sample) ) 
+```
+
+```{r}
+setdiff(  gsub("_.*","",geno(QGP_ME_VCF)$GT |> colnames())  ,  gsub("_.*","",QGP_population_structure$NewID) ) |> head()
+```
+
+```{r}
+readr::write_tsv(QGP_population_structure, file="../data/MEGAnE_analysis/QGP_population_structure_final.tsv")
+```
+
+```{r}
+head(QGP_population_structure)
+```
+
+
+## Load PCA analysis results
+
+```{r}
+KGP_PCA = readr::read_tsv("../MeGAne/PCA_analysis/06_pca/KGP_ref.eigenvec")
+colnames(KGP_PCA) = gsub("#FID","FID",colnames(KGP_PCA))
+
+QGP_PCA = readr::read_tsv("../MeGAne/PCA_analysis/06_pca/QGP.pruned.pruned.eigenvec")
+colnames(QGP_PCA) = gsub("#FID","FID",colnames(QGP_PCA))
+
+QGP_PCA$IID = gsub("^1_","",QGP_PCA$IID)
+QGP_PCA$FID = gsub("^1_","",QGP_PCA$FID)
+QGP_PCA$ID = gsub("_.*","",QGP_PCA$IID)
+
+pos = match(QGP_PCA$ID, QGP_population_structure$NewID)
+QGP_PCA$Population= QGP_population_structure$Population[pos]
+
+
+## Assign colors to populations
+pop_map <- tribble(
+  ~Population,              ~Color,       ~code, ~qgp_pop,  ~hex,
+  "AdmixedPop",      "Mushroom",    "00",  "QGP_ADM", "#4E1594",
+  "GeneralArabs",    "Blueberry",   "Q1b", "QGP_GA", "#4E79A7",
+  "EastAfricans",    "Orange",      "Q3",  "QGP_AFR", "#F28E2B",
+  "PeninsularArabs", "Coral",       "Q1a", "QGP_PAR", "#76B7B2",
+  "Persians",        "Strawberry",  "Q2a", "QGP_WEP", "#E15759",
+  "South Asians",    "Lemon",       "Q2b", "QGP_SAS", "#EDC948"
+)
+
+pop_col_map = pop_map$hex
+names(pop_col_map) =  pop_map$qgp_pop
+
+QGP_PCA = QGP_PCA |> 
+  dplyr::filter(!is.na(Population)) |>
+  dplyr::left_join(pop_map)
+
+plt_pca = plotthis::DimPlot(QGP_PCA,
+                  dims = 3:4,
+                  group_by = "Population",
+                  label = TRUE,
+                  label_insitu = TRUE,
+                  label_bg = NA,
+                  pt_size = 1,
+                  pt_alpha = 0.6,
+                  label_pt_color = "black",
+                  label_bg_r = 0,
+                  label_fg = "black",
+                  label_size = 4,
+                  label_repel = TRUE) +
+  scale_color_manual(values = pop_col_map)
+
+ggsave(plot = plt_pca, filename = "../data/MEGAnE_analysis/QGP_ME_PCA.pdf",width = 6,height = 6)
+ggsave(plot = plt_pca, filename = "../data/MEGAnE_analysis/QGP_ME_PCA.png",width = 6,height = 6)
+plt_pca
+```
+
+# Classify QGP allele frequencies into bins and annotate with SV types
+
+```{r}
+qgp_af = readr::read_tsv("../MeGAne/PCA_analysis/additional/QGP_AF.tsv",
+                         col_names = FALSE)
+
+colnames(qgp_af) = c("ID","AC","AN","AF")
+
+qgp_af_classified <- qgp_af |>
+  mutate(
+    af_bin = case_when(
+      AC == 1                  ~ "Singleton",
+      AF > 0   & AF <  0.01   ~ "<1%",
+      AF >= 0.01 & AF < 0.50  ~ "≥1%",
+      AF >= 0.50               ~ "≥50%"
+    ) |> factor(levels = c("≥50%", "≥1%", "<1%", "Singleton") |> rev())
+  ) |>
+  filter(!is.na(af_bin))
+```
+
+
+```{r}
+qgp_af_classified_detailed = qgp_af_classified
+pos = match(qgp_af_classified$ID, QGP_SVTYPES$ID)
+qgp_af_classified_detailed$Class = QGP_SVTYPES$category[pos]
+qgp_af_classified_detailed$ME_TYPE = ifelse(grepl("_ins_",qgp_af_classified_detailed$ID),"ME_insertion","ME_absence")
+```
+
+```{r}
+qgp_gt_matrix <- geno(QGP_ME_VCF)$GT
+
+qgp_gt_dosage = matrix(0, 
+                   nrow = nrow(qgp_gt_matrix), 
+                   ncol = ncol(qgp_gt_matrix),
+                   dimnames = dimnames(qgp_gt_matrix)
+                   )
+
+qgp_gt_dosage[qgp_gt_matrix %in% c("0/0","0|0")] = 0
+qgp_gt_dosage[qgp_gt_matrix %in% c("0/1", "1/0","1/.","./1","1|0","0|1")] = 1
+qgp_gt_dosage[qgp_gt_matrix %in% c("1/1","1|1")] = 2
+
+
+qgp_smp_order = colSums(qgp_gt_dosage) |> order()
+
+qgp_gt_dosage = qgp_gt_dosage[,qgp_smp_order]
+
+
+
+cli::cli_progress_bar(total  = ncol(qgp_gt_dosage))
+
+qgp_cum_stats = data.frame()
+processed_me = c()
+
+for(smp in colnames(qgp_gt_dosage)){
+  
+  cli::cli_progress_update()
+  me_in_sample = rownames(qgp_gt_dosage)[which(qgp_gt_dosage[,smp] >0)]
+  me_in_sample = setdiff(me_in_sample,processed_me)
+  
+  if(length(me_in_sample)>0){
+    df = qgp_af_classified |>
+      dplyr::filter(ID %in% me_in_sample) |>
+      dplyr::rename(ME_freq = af_bin) |>
+      dplyr::group_by(ME_freq) |>
+      tally() |>
+      dplyr::mutate(Sample = smp) |>
+      dplyr::select(Sample, ME_freq, n) |>
+      tidyr::complete(
+          Sample,
+          ME_freq,              # uses factor levels
+          fill = list(n = 0)
+        ) |>
+      pivot_wider(
+        names_from  = ME_freq,
+        values_from = n,
+      ) |>
+      column_to_rownames("Sample")
+    
+    if(nrow(qgp_cum_stats)>0){
+        df2 = rbind(qgp_cum_stats[nrow(qgp_cum_stats),],df)
+        cs = colSums(df2)
+        df[1,] = cs
+    }
+        
+    qgp_cum_stats = rbind(qgp_cum_stats, df)
+    processed_me = c(processed_me,me_in_sample)
+  }
+}
+cli::cli_progress_done()
+```
+
+
+```{r}
+qgp_cum_stats$Step = 1:nrow(qgp_cum_stats)
+
+qgp_cum_stats_long = qgp_cum_stats |>
+  pivot_longer(!Step,names_to = "AF_bin",values_to = "cumSum") |>
+  dplyr::mutate(AF_bin = factor(AF_bin,levels = c("≥50%", "≥1%", "<1%", "Singleton") |> rev())) |>
+  dplyr::mutate(Sample = gsub("_.*","",colnames(qgp_gt_dosage)[Step])) |>
+  dplyr::left_join(QGP_population_structure[,c("NewID","Population")],by = c("Sample" = "NewID"))
+```
+
+
+```{r fig.height=6, fig.width=6}
+
+af_colors <- 
+c(
+  "Singleton" = "#f5e6e8",
+  "<1%"       = "#d5c6e0",
+  "≥1%"       = "#aaa1c8",
+  "≥50%"      = "#192a51"
+)
+
+qgp_cum_stats_long = subset(qgp_cum_stats_long, !is.na(qgp_cum_stats_long$Population))
+
+qgp_cum_stats_plt = ggplot(qgp_cum_stats_long,aes(x=Step,y=cumSum, fill=AF_bin)) + 
+  geom_area() + 
+  geom_rug(aes(color=Population,group = Population),sides="b", position = "jitter") +
+  scale_fill_manual(values = af_colors) +  
+  scale_color_manual(values = pop_col_map) +
+  scale_x_continuous(
+      breaks = scales::breaks_width(1000),
+      labels = scales::label_comma()
+    ) +
+  theme_scp() +
+  xlab(glue("QGP individuals (n={prettyNum(ncol(qgp_gt_matrix),big.mark = ',')})")) +
+  ylab("Number of MEVs") +
+  theme(aspect.ratio = 0.6,
+        axis.title = element_text(size = 11),
+        axis.text  = element_text(size = 9) )
+
+ggsave(plot = qgp_cum_stats_plt, filename = "../data/MEGAnE_analysis/QGP_ME_cumFreq.pdf",width = 6,height = 6)
+ggsave(plot = qgp_cum_stats_plt, filename = "../data/MEGAnE_analysis/QGP_ME_cumFreq.png",width = 6,height = 6)
+
+qgp_cum_stats_plt
+```
+
+## Generate ME families distribution by QGP population
+
+```{r fig.height=12, fig.width=12}
+QGP_populations_svtypes = list()
+
+QGP_populations_svtypes_plts = list()
+
+for(pop in sort(levels(QGP_population_structure$Population))){
+  
+  
+  pop_samples = QGP_population_structure |>
+    dplyr::filter(Population == pop) |>
+    pull(NewID)
+  
+  pos = match(pop_samples, gsub("_.*","", colnames(qgp_gt_dosage)))
+  
+  pos = pos[!is.na(pos)]
+  
+  rs = rowSums(qgp_gt_dosage[,pos]>0)
+  
+  pop_mevs = rownames(qgp_gt_dosage)[rs>0]
+  
+  pop_svtypes = QGP_SVTYPES[pop_mevs,]
+  
+  QGP_populations_svtypes[[pop]] = pop_svtypes
+  
+  
+  pop_pie   <- pop_svtypes |>
+          dplyr::mutate(category = factor(category, levels = names(me_colors) )) |>
+          dplyr::group_by(category) |>
+          dplyr::tally() |>
+          dplyr::mutate(pct=100 * n/sum(n)) |>
+          dplyr::arrange(category) |>
+          dplyr::mutate(label = glue("{category} ({round(pct,2)}%)"))
+  
+  pop_plt = plotthis::PieChart(pop_pie,
+                          x="label", 
+                          y="pct",
+                          group_by="category",
+                          label = "category",
+                          palcolor = me_colors, 
+                          title = pop) +
+    theme(legend.position = "right", 
+          plot.title = element_text(hjust = 0.5,size = 11,face = "bold"), 
+          legend.key.spacing.y = unit(0.15, "cm")) +
+    labs(
+      fill  = "ME family"
+      )
+
+  
+  QGP_populations_svtypes_plts[[pop]] = pop_plt
+}
+
+QGP_populations_svtypes_plts_combined = patchwork::wrap_plots(QGP_populations_svtypes_plts)
+
+
+ggsave(plot = QGP_populations_svtypes_plts_combined, 
+       filename = "../data/MEGAnE_analysis/MEV_families_byPopulation.pdf",width = 12,height = 12)
+
+ggsave(plot = QGP_populations_svtypes_plts_combined, 
+       filename = "../data/MEGAnE_analysis/MEV_families_byPopulation.png",width = 12,height = 12)
+
+
+writeListToExcelSheet(QGP_populations_svtypes,
+                      outputFilePath = "../data/MEGAnE_analysis/MEV_families_byPopulation.xlsx")
+
+QGP_populations_svtypes_plts_combined
+```
+
+## Cumulative distribution by ME family
+
+```{r}
+QGP_SVTYPES$category = factor(QGP_SVTYPES$category,levels = names(me_colors))
+
+pop_cum_stats_all = list()
+
+for(pop in sort(levels(QGP_population_structure$Population))){
+  cli::cli_h2(pop)
+
+  pop_samples = QGP_population_structure |>
+    dplyr::filter(Population == pop) |>
+    pull(NewID)
+  
+  pos = match(pop_samples, gsub("_.*","", colnames(qgp_gt_dosage)))
+  
+  pos = pos[!is.na(pos)]
+  
+  rs = rowSums(qgp_gt_dosage[,pos]>0)
+  
+  pop_mevs = rownames(qgp_gt_dosage)[rs>0]
+  
+  pop_gt_dosage = qgp_gt_dosage[pop_mevs,pos]
+  
+  pop_smp_order = colSums(pop_gt_dosage) |> order()
+  pop_gt_dosage = pop_gt_dosage[,pop_smp_order]
+  
+  pop_cum_stats = data.frame()
+  pop_processed_me = c()
+  
+  pop_svtypes = QGP_SVTYPES[pop_mevs,]
+  
+  cli::cli_progress_bar(total  = ncol(pop_gt_dosage))
+
+  for(smp in colnames(pop_gt_dosage)){
+  
+   cli::cli_progress_update()
+    me_in_sample = rownames(pop_gt_dosage)[which(pop_gt_dosage[,smp] >0)]
+    me_in_sample = setdiff(me_in_sample,pop_processed_me)
+    
+    if(length(me_in_sample)>0){
+      
+       df = pop_svtypes |>
+        dplyr::filter(ID %in% me_in_sample) |>
+        dplyr::group_by(category) |>
+        tally() |>
+        dplyr::mutate(Sample = smp) |>
+        dplyr::select(Sample, category, n) |>
+        tidyr::complete(
+            Sample,
+            category,              # uses factor levels
+            fill = list(n = 0)
+          ) |>
+        pivot_wider(
+          names_from  = category,
+          values_from = n,
+        ) |>
+        column_to_rownames("Sample")
+       
+       if(nrow(pop_cum_stats)>0){
+            df2 = rbind(pop_cum_stats[nrow(pop_cum_stats),],df)
+            cs = colSums(df2)
+            df[1,] = cs
+       }
+            
+       pop_cum_stats = rbind(pop_cum_stats, df)
+       pop_processed_me = c(pop_processed_me,me_in_sample)
+    }
+  }
+  cli::cli_progress_done()
+  
+  pop_cum_stats$Population = pop
+  
+  pop_cum_stats_all[[pop]] = pop_cum_stats
+}
+```
+
+```{r fig.height=12, fig.width=12}
+pop_cum_stats_plts = list()
+pop_nb_mevs_all = data.frame()
+
+
+for( pop in names(pop_cum_stats_all)){
+  
+  pop_cum_stats = pop_cum_stats_all[[pop]]
+  
+  pop_cum_stats$Step = 1:nrow(pop_cum_stats)
+  
+  pop_cum_stats_long = pop_cum_stats |>
+    pivot_longer(!c(Step,Population),names_to = "MEV",values_to = "cumSum") |>
+    dplyr::mutate(MEV = factor(MEV,levels = names(me_colors) |> rev())) 
+  
+  pop_nb_mev = sum(tail(pop_cum_stats[,names(me_colors)],1))
+  
+  df = tail(pop_cum_stats,1)
+  df$total = pop_nb_mev
+  
+  pop_nb_mevs_all = rbind(pop_nb_mevs_all, df)
+
+  pop_plt = ggplot(pop_cum_stats_long,aes(x=Step,y=cumSum, fill=MEV)) + 
+    geom_area() + 
+    scale_fill_manual(values = me_colors) +  
+    scale_x_continuous(
+        breaks = scales::breaks_width(1000),
+        labels = scales::label_comma()
+      ) +
+    theme_scp() +
+    xlab("") +
+    ylab("Number of MEVs") +
+    ggtitle(pop, subtitle = glue("{prettyNum(pop_nb_mev,big.mark = ',')} MEVs")) +
+    theme(aspect.ratio = 0.6,
+          plot.title = element_text(hjust = 0.5,size = 11),
+          plot.subtitle = element_text(hjust = 0.5,size = 9),
+          axis.title = element_text(size = 11),
+          axis.text  = element_text(size = 9) )
+  
+  pop_cum_stats_plts[[pop]] = pop_plt
+}
+
+
+pop_cum_stats_plts_combined = patchwork::wrap_plots(pop_cum_stats_plts,guides = "collect")
+
+ggsave(plot = pop_cum_stats_plts_combined, 
+       filename = "../data/MEGAnE_analysis/MEV_families_cumulative_byPopulation.pdf",width = 12,height = 12)
+
+ggsave(plot = pop_cum_stats_plts_combined, 
+       filename = "../data/MEGAnE_analysis/MEV_families_cumulative_byPopulation.png",width = 12,height = 12)
+
+pop_cum_stats_plts_combined
+```
+
+
+```{r fig.height=5, fig.width=5}
+pop_nb_mevs_all_long = pop_nb_mevs_all |>
+          dplyr::arrange(-total) |>
+          dplyr::select(names(me_colors), Population) |>
+          pivot_longer(!Population, names_to = "MEV",values_to = "Count") |>
+          dplyr::mutate(MEV = factor(MEV, levels = names(me_colors) |> rev() )) |>
+          dplyr::mutate(Population = factor(Population, levels = unique(Population))) 
+
+pop_nb_mevs_plt = plotthis::BarPlot(pop_nb_mevs_all_long, x="Population",
+                  y="Count",group_by = "MEV",
+                  x_text_angle = 40
+                  ) +
+  scale_fill_manual(values = me_colors) +
+  coord_cartesian(ylim = c(0,max(pop_nb_mevs_all$total * 1.1)))
+
+
+ggsave(plot = pop_nb_mevs_plt, 
+       filename = "../data/MEGAnE_analysis/nb_MEVs_byPopulation.pdf",width = 5,height = 5)
+
+ggsave(plot = pop_nb_mevs_plt, 
+       filename = "../data/MEGAnE_analysis/nb_MEVs_byPopulation.png",width = 5,height = 5)
+
+writeExcelSheet(pop_nb_mevs_all_long, sheetName = "nb_MEVs_byPopulation",
+                outputFilePath = "../data/MEGAnE_analysis/nb_MEVs_byPopulation.xlsx")
+
+pop_nb_mevs_plt
+```
